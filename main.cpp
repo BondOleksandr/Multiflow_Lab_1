@@ -2,6 +2,11 @@
 #include <random>
 #include <chrono>
 #include <limits>
+#include <mpi.h>
+#include <vector>
+#include <cstring>
+#include <algorithm>
+
 using namespace std;
 
 struct assets {
@@ -18,7 +23,7 @@ double GetRandom(double mod) {
     return dist(gen);
 }
 
-double D_Validator() {
+double D_Validator() {//makes sure your input is double
     double x;
     for (;;) {
         if (cin >> x) return x;
@@ -28,7 +33,7 @@ double D_Validator() {
     }
 }
 
-int I_Validator() {
+int I_Validator() {//makes sure your input is int
     int x;
     for (;;) {
         if (cin >> x) return x;
@@ -38,7 +43,7 @@ int I_Validator() {
     }
 }
 
-assets Generator(double mod) {
+assets Generator(double mod) {//generates matrix and vector, asks for size
     assets prod;
     int size = 0;
     for (;;) {
@@ -62,7 +67,7 @@ assets Generator(double mod) {
     return prod;
 }
 
-assets Manual() {
+assets Manual() {//manual input of matrix and vector
     assets prod;
     int size = 0;
     for (;;) {
@@ -93,7 +98,7 @@ assets Manual() {
     return prod;
 }
 
-void calc(assets& a) {
+void calc(assets& a) {//single-thread calculation, measures time
     auto start = chrono::high_resolution_clock::now();
     for (int i = 0; i < a.Size; ++i)
         for (int j = 0; j < a.Size; ++j)
@@ -103,7 +108,94 @@ void calc(assets& a) {
     cout << "Calculation completed in " << dt.count() << " ms\n";
 }
 
-void Free(assets& a) {
+void multiflow_calc(assets &a) {//MPI-CALCULATION
+    // Start measuring total time
+    auto start = std::chrono::high_resolution_clock::now();
+    int argc = 0; char** argv = nullptr;
+    MPI_Init(&argc, &argv);
+
+    int rank = 0, procs = 1;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &procs);
+
+    int N = (rank == 0 ? a.Size : 0);
+    MPI_Bcast(&N, 1, MPI_INT, 0, MPI_COMM_WORLD);
+
+    if (N <= 10 || procs < 2 || procs > 8) {
+        if (rank == 0)
+            std::cerr << "[MPI] Invalid parameters (N=" << N
+                      << ", procs=" << procs << ")\n";
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+
+    // Broadcast vector x
+    std::vector<double> x(N);
+    if (rank == 0) std::memcpy(x.data(), a.pVector, sizeof(double) * N);
+    MPI_Bcast(x.data(), N, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+
+    // Distribute rows of matrix among processes
+    std::vector<int> rows(procs, N / procs);
+    for (int i = 0; i < N % procs; ++i) rows[i]++;
+    std::vector<int> displ_rows(procs, 0);
+    for (int i = 1; i < procs; ++i)
+        displ_rows[i] = displ_rows[i - 1] + rows[i - 1];
+
+    std::vector<int> sendcounts(procs), displs(procs);
+    for (int i = 0; i < procs; ++i) {
+        sendcounts[i] = rows[i] * N;
+        displs[i] = displ_rows[i] * N;
+    }
+
+    std::vector<double> A_local(sendcounts[rank]);
+    std::vector<double> y_local(rows[rank], 0.0);
+
+    MPI_Scatterv(
+        (rank == 0 ? a.pMatrix : nullptr), sendcounts.data(), displs.data(), MPI_DOUBLE,
+        A_local.data(), sendcounts[rank], MPI_DOUBLE,
+        0, MPI_COMM_WORLD
+    );
+
+    // Local computation
+    for (int r = 0; r < rows[rank]; ++r) {
+        const double* row = &A_local[r * N];
+        double sum = 0.0;
+        for (int j = 0; j < N; ++j)
+            sum += row[j] * x[j];
+        y_local[r] = sum;
+    }
+
+    // Gather results
+    std::vector<int> recvcounts(procs), recvdispl(procs);
+    for (int i = 0; i < procs; ++i) {
+        recvcounts[i] = rows[i];
+        recvdispl[i] = displ_rows[i];
+    }
+
+    if (rank == 0) {
+        if (!a.pResult) a.pResult = new double[N];
+        a.Size = N;
+    }
+
+    MPI_Gatherv(
+        y_local.data(), rows[rank], MPI_DOUBLE,
+        (rank == 0 ? a.pResult : nullptr),
+        recvcounts.data(), recvdispl.data(), MPI_DOUBLE,
+        0, MPI_COMM_WORLD
+    );
+
+    if (rank == 0)
+        std::cout << "\n[MPI] Matrix " << N << "x" << N
+                  << " | Processes: " << procs
+                  << " | Total time: " << max_ms << " ms\n";
+
+    MPI_Finalize();
+
+    auto end = std::chrono::high_resolution_clock::now();
+    chrono::duration<double, milli> dt = end - start;
+    cout << "Calculation completed in " << dt.count() << " ms\n";
+}
+
+void Free(assets& a) {//cleaner
     delete[] a.pMatrix;  a.pMatrix = nullptr;
     delete[] a.pVector;  a.pVector = nullptr;
     delete[] a.pResult;  a.pResult = nullptr;
